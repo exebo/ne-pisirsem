@@ -147,6 +147,20 @@ function renderResults(){
  // Sadece metin düğümünü güncelleyerek favCount elemanının silinmesini engelliyoruz.
  $('favoritesBtn').firstChild.textContent=onlyFavorites?'♥ Favoriler açık ':'♡ Favoriler ';
 }
+function showExternalTranslation(r,note,message){
+  note.textContent=message+' ';
+  // Servis erisimi olmasa da tek tikla kaynak metni ceviri sitesinde acabilsin.
+  // Cok uzun tariflerde URL uzunlugunu sinirliyoruz, bu durumda metnin basi acilir.
+  const english=String(r.instructions||'');
+  if(english){
+    const link=document.createElement('a');
+    link.href='https://translate.google.com/?sl=en&tl=tr&op=translate&text='+encodeURIComponent(english.slice(0,3500));
+    link.target='_blank';link.rel='noopener noreferrer';
+    link.textContent='🌐 Türkçe çeviriyi aç ↗';
+    link.className='translationExternal';
+    note.appendChild(link);
+  }
+}
 async function loadTurkishDetail(r){
  const id=r.id;
  if(r.source!=='TheMealDB')return;
@@ -157,14 +171,17 @@ async function loadTurkishDetail(r){
   const content=$('instructionText');const note=$('translationNote');
   if(response.ok&&data.translated&&data.instructions){
    content.textContent=data.instructions;
-   note.textContent='Otomatik Türkçe çeviri. Ölçü ve pişirme talimatlarını kontrol et.';
+   note.textContent='Otomatik Türkçe çeviri. Pişirme adımlarını ve ölçüleri kontrol et.';
    if(data.name){r.displayName=data.name;const title=$('detailTitle');if(title)title.textContent=data.name;renderResults();}
   }else{
    content.textContent=r.instructions||'Hazırlanış bilgisi bulunamadı.';
-   note.textContent=(data&&data.message)||'Türkçe çeviri şu an kullanılamıyor; orijinal metin gösteriliyor.';
+   showExternalTranslation(r,note,(data&&data.message)||'Türkçe çeviri servisi şu anda kullanılamıyor.');
   }
  }catch{
-  if(currentDetailId===id&&$('recipeDialog').open){$('instructionText').textContent=r.instructions||'';$('translationNote').textContent='Çeviri servisine ulaşılamadı; orijinal metin gösteriliyor.';}
+  if(currentDetailId===id&&$('recipeDialog').open){
+    $('instructionText').textContent=r.instructions||'';
+    showExternalTranslation(r,$('translationNote'),'Türkçe çeviri sunucusuna ulaşılamadı.');
+  }
  }
 }
 function detail(id){
