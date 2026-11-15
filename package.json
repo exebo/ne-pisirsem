@@ -1,0 +1,12 @@
+{
+  "name": "ne-pisirsem",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TheMealDB destekli yemek tarifi bulucu",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
