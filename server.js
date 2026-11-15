@@ -85,4 +85,6 @@ const server=http.createServer((req,res)=>{
     if(req.method==='HEAD')res.end();else res.end(content);
   });
 });
-server.listen(PORT,HOST,()=>console.log(`Ne Pişirsem? http://${HOST}:${PORT} | Node 18+`));
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Ne Pişirsem? sunucu ${PORT} portunda çalışıyor.`);
+});
