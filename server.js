@@ -17,88 +17,133 @@ try {
   if (Array.isArray(c.recipes)) { remote=c.recipes; state={status:'Hazır',imported:remote.length,updatedAt:c.updatedAt,error:null}; }
 } catch {}
 
-// Ücretsiz MyMemory çevirisi: yalnızca kullanıcı tarif açınca istenir.
-// 500 bayt/istek ve 5000 karakter/gün anonim limitine karşı kontrollü tüketim.
-const TRANSLATION_CACHE_FILE = path.join(ROOT,'data','translation-cache.json');
-const TRANSLATION_ENDPOINT = process.env.TRANSLATION_API_URL || 'https://api.mymemory.translated.net/get';
+// Tarif acildiginda Ingilizce -> Turkce ceviri. Once alternatif ucretsiz
+// saglayici denenir; erisim siniri/yasak durumunda MyMemory'ye gecilir.
+// Google'in bu ucu resmi API degildir; her zaman calisacagi garanti edilmez.
+const TRANSLATION_CACHE_FILE = path.join(ROOT, 'data', 'translation-cache.json');
+const MYMEMORY_ENDPOINT = process.env.TRANSLATION_API_URL || 'https://api.mymemory.translated.net/get';
+const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/t';
 const translationCache = new Map();
 const ongoingTranslations = new Map();
 let usageDate = new Date().toISOString().slice(0,10);
 let translatedCharsToday = 0;
 try {
- const c = JSON.parse(fs.readFileSync(TRANSLATION_CACHE_FILE,'utf8'));
- for(const [id,entry] of Object.entries(c)) if(entry && typeof entry.instructions==='string')translationCache.set(id,entry);
+  const c=JSON.parse(fs.readFileSync(TRANSLATION_CACHE_FILE,'utf8'));
+  for (const [id,item] of Object.entries(c)) if(item && typeof item.instructions==='string')translationCache.set(id,item);
 } catch {}
 function translationHash(recipe){return crypto.createHash('sha256').update(recipe.name+'\n'+recipe.instructions).digest('hex').slice(0,20);}
 function saveTranslations(){
- try {fs.writeFileSync(TRANSLATION_CACHE_FILE,JSON.stringify(Object.fromEntries(translationCache)));}
- catch(err){console.warn('Çeviri önbelleği diske yazılamadı:',err.message);}
+  try {fs.writeFileSync(TRANSLATION_CACHE_FILE,JSON.stringify(Object.fromEntries(translationCache)));}
+  catch(err){console.warn('Ceviri onbellegi kalici yazilamadi:',err.message);}
 }
-// Türkçe çeviri en fazla 440 UTF-8 baytlık parçalara bölünür (API üst sınırı 500).
-function translationChunks(text){
- const parts=[];let current='';
- const words=String(text).replace(/\r/g,'').split(/\s+/).filter(Boolean);
- for(const word of words){
-  // Uzun tek bir sözcük gelirse güvenlik için parçalar hâlinde tut.
-  if(Buffer.byteLength(word,'utf8')>440){
-   if(current){parts.push(current);current='';}
-   let piece='';for(const c of word){if(Buffer.byteLength(piece+c,'utf8')>440){parts.push(piece);piece='';}piece+=c;}if(piece)parts.push(piece);
-   continue;
+// Istege uygun parcala, mumkun oldugunda cumleleri bir arada tut.
+// MyMemory: en fazla 500 bayt; guvenlik payi 420. Alternatif: 800 bayt.
+function translationChunks(raw,maxBytes){
+  const text=String(raw||'').replace(/\r/g,'').trim();
+  if(!text)return [];
+  const words=text.split(/\s+/).filter(Boolean);
+  const chunks=[];let current='';
+  for(const word of words){
+    const candidate=current?current+' '+word:word;
+    if(Buffer.byteLength(candidate,'utf8')<=maxBytes){current=candidate;continue;}
+    if(current){chunks.push(current);current='';}
+    if(Buffer.byteLength(word,'utf8')<=maxBytes){current=word;continue;}
+    let part='';
+    for(const char of word){
+      if(Buffer.byteLength(part+char,'utf8')>maxBytes){if(part)chunks.push(part);part='';}
+      part+=char;
+    }
+    current=part;
   }
-  const next=current?current+' '+word:word;
-  if(Buffer.byteLength(next,'utf8')>440){if(current)parts.push(current);current=word;}
-  else current=next;
- }
- if(current)parts.push(current);
- return parts;
+  if(current)chunks.push(current);
+  return chunks;
 }
 function decodeTranslationEntities(input){
- return String(input).replace(/&(#x[0-9a-f]+|#\d+|amp|quot|apos|lt|gt|nbsp);/gi,(whole,entity)=>{
-  const e=entity.toLowerCase();
-  const named={amp:'&',quot:'"',apos:"'",lt:'<',gt:'>',nbsp:' '};
-  if(named[e]!==undefined)return named[e];
-  const num=e.startsWith('#x')?parseInt(e.slice(2),16):parseInt(e.slice(1),10);
-  return Number.isInteger(num)&&num>0&&num<=0x10ffff?String.fromCodePoint(num):whole;
- });
+  return String(input).replace(/&(#x[0-9a-f]+|#\d+|amp|quot|apos|lt|gt|nbsp);/gi,(whole,entity)=>{
+    const e=entity.toLowerCase();const named={amp:'&',quot:'"',apos:"'",lt:'<',gt:'>',nbsp:' '};
+    if(named[e]!==undefined)return named[e];
+    const num=e.startsWith('#x')?parseInt(e.slice(2),16):parseInt(e.slice(1),10);
+    return Number.isInteger(num)&&num>0&&num<=0x10ffff?String.fromCodePoint(num):whole;
+  });
 }
-async function translateChunk(english){
- const url=new URL(TRANSLATION_ENDPOINT);
- url.searchParams.set('q',english);url.searchParams.set('langpair','en|tr');
- const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
- try{
-  const response=await fetch(url,{signal:controller.signal,headers:{Accept:'application/json'}});
-  if(!response.ok)throw new Error('Çeviri servisi şu an erişilemiyor.');
-  const json=await response.json();
-  const translated=json?.responseData?.translatedText;
-  if(Number(json?.responseStatus)!==200||typeof translated!=='string'||!translated.trim()||/MYMEMORY WARNING|QUERY LENGTH LIMIT/i.test(translated))throw new Error('Ücretsiz çeviri sınırına ulaşıldı.');
+async function fetchJsonWithTimeout(url,timeoutMs=7500){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),timeoutMs);
+  try{
+    const response=await fetch(url,{signal:controller.signal,headers:{Accept:'application/json'}});
+    if(!response.ok)throw new Error('HTTP '+response.status);
+    return await response.json();
+  }finally{clearTimeout(timer);}
+}
+async function googleTranslateText(english){
+  const url=new URL(GOOGLE_ENDPOINT);
+  url.searchParams.set('client','dict-chrome-ex');
+  url.searchParams.set('sl','en');url.searchParams.set('tl','tr');url.searchParams.set('q',english);
+  const result=await fetchJsonWithTimeout(url);
+  // Bu belgelenmemis uc iki farkli dizi yanit yapisi verebiliyor.
+  let translated;
+  if(Array.isArray(result)&&Array.isArray(result[0])) translated=result[0][0];
+  else if(Array.isArray(result)&&typeof result[0]==='string')translated=result[0];
+  if(typeof translated!=='string'||!translated.trim())throw new Error('Gecersiz ceviri yaniti');
   return decodeTranslationEntities(translated.trim());
- }finally{clearTimeout(timer);}
+}
+async function myMemoryTranslateText(english){
+  const day=new Date().toISOString().slice(0,10);
+  if(day!==usageDate){usageDate=day;translatedCharsToday=0;}
+  if(translatedCharsToday+english.length>4500)throw new Error('Gunluk anonim ceviri siniri');
+  // MyMemory, basarisiz isteklerde de sayaç tuketebilir.
+  translatedCharsToday+=english.length;
+  const url=new URL(MYMEMORY_ENDPOINT);
+  url.searchParams.set('q',english);
+  url.searchParams.set('langpair','en|tr');
+  if(process.env.MYMEMORY_EMAIL)url.searchParams.set('de',process.env.MYMEMORY_EMAIL);
+  const result=await fetchJsonWithTimeout(url);
+  const translated=result?.responseData?.translatedText;
+  if(Number(result?.responseStatus)!==200||typeof translated!=='string'||!translated.trim()||/MYMEMORY WARNING|QUERY LENGTH LIMIT/i.test(translated)){
+    throw new Error('MyMemory cevirisi kullanilamiyor');
+  }
+  return decodeTranslationEntities(translated.trim());
+}
+async function translateWith(recipe,method,limit){
+  const parts=translationChunks(recipe.instructions,limit);
+  if(!parts.length)throw new Error('Hazirlanis metni bos');
+  const translated=[];
+  for(const part of parts){translated.push(await method(part));}
+  const text=translated.join('\n');
+  // Farkli bir dile cevrilmemisse yanlis basari gostermeyelim.
+  if(text.toLowerCase()===parts.join('\n').toLowerCase() && text.length>25)throw new Error('Ceviri degismedi');
+  // Tarif adinin cevirisi hatali olsa bile hazirlanisi goster.
+  let name=recipe.name;
+  try{name=await method(recipe.name);}catch{}
+  return {name,instructions:text};
 }
 async function translateRecipe(id){
- const recipe=remote.find(r=>r.id===id);
- if(!recipe)throw new Error('Tarif bulunamadı.');
- const fingerprint=translationHash(recipe);
- const cached=translationCache.get(id);
- if(cached?.hash===fingerprint)return {translated:true,name:cached.name,instructions:cached.instructions,fromCache:true};
- if(ongoingTranslations.has(id))return ongoingTranslations.get(id);
- const job=(async()=>{
-  const parts=translationChunks(recipe.instructions||'');
-  const inputs=[recipe.name,...parts];
-  const count=inputs.reduce((sum,x)=>sum+x.length,0);
-  if(!parts.length)throw new Error('Bu tarifte çevrilecek hazırlanış bilgisi bulunamadı.');
-  const day=new Date().toISOString().slice(0,10);
-  if(usageDate!==day){usageDate=day;translatedCharsToday=0;}
-  // Tüm metne yetecek kota yoksa kısmi ve yanıltıcı çeviri göstermiyoruz.
-  if(count>4400||translatedCharsToday+count>4400)throw new Error('Ücretsiz çeviri hizmetinin günlük sınırına ulaşıldı. Orijinal metin gösteriliyor.');
-  translatedCharsToday+=count; // İstekler başarısız olsa da tekrarla kotayı aşmayalım.
-  const name=await translateChunk(recipe.name);
-  const translations=[];
-  for(const part of parts)translations.push(await translateChunk(part));
-  const result={hash:fingerprint,name,instructions:translations.join('\n')};
-  translationCache.set(id,result);saveTranslations();
-  return {translated:true,name:result.name,instructions:result.instructions,fromCache:false};
- })().finally(()=>ongoingTranslations.delete(id));
- ongoingTranslations.set(id,job);return job;
+  const recipe=remote.find(r=>r.id===id);
+  if(!recipe)throw new Error('Tarif bulunamadi.');
+  const fingerprint=translationHash(recipe);
+  const cached=translationCache.get(id);
+  if(cached?.hash===fingerprint)return {translated:true,name:cached.name,instructions:cached.instructions,fromCache:true};
+  if(ongoingTranslations.has(id))return ongoingTranslations.get(id);
+  const job=(async()=>{
+    let result;let provider;
+    try{
+      result=await translateWith(recipe,googleTranslateText,800);
+      provider='alternatif';
+    }catch(error){
+      console.warn('Alternatif ceviri kullanilamiyor:',error.message);
+      try{
+        result=await translateWith(recipe,myMemoryTranslateText,420);
+        provider='MyMemory';
+      }catch(fallbackError){
+        console.warn('MyMemory cevirisi kullanilamiyor:',fallbackError.message);
+        throw new Error('Otomatik ceviri gecici olarak kullanilamiyor. Harici ceviri baglantisini kullanabilirsin.');
+      }
+    }
+    translationCache.set(id,{hash:fingerprint,...result});saveTranslations();
+    return {translated:true,...result,fromCache:false,provider};
+  })().finally(()=>ongoingTranslations.delete(id));
+  ongoingTranslations.set(id,job);
+  return job;
 }
 function translatedRecipes(){return [...local,...remote.map(r=>{
  const cached=translationCache.get(r.id);
@@ -176,7 +221,7 @@ const server=http.createServer((req,res)=>{
   if(!file.startsWith(pub+path.sep)) {res.writeHead(403);return res.end('Forbidden');}
   fs.readFile(file,(err,content)=>{
     if(err){res.writeHead(404);return res.end('Sayfa bulunamadı');}
-    res.writeHead(200,{'Content-Type':types[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff'});
+    res.writeHead(200,{'Content-Type':types[path.extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':'no-store'});
     if(req.method==='HEAD')res.end();else res.end(content);
   });
 });
